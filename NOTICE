@@ -1,0 +1,42 @@
+medical_image_classification
+============================
+
+개인 학습·연구 목적 프로젝트. 의료 진단·임상 사용 금지.
+Personal educational/research use only. NOT for medical diagnosis or clinical use.
+
+----------------------------------------------------------------------
+Third-party datasets
+----------------------------------------------------------------------
+
+1) NIH ChestX-ray14
+   - Source: U.S. National Institutes of Health Clinical Center
+   - URL: https://nihcc.app.box.com/v/ChestXray-NIHCC
+   - License: Public Domain (U.S. Government work)
+   - Citation:
+     Wang X. et al., "ChestX-ray8: Hospital-scale Chest X-ray Database
+     and Benchmarks on Weakly-Supervised Classification and Localization
+     of Common Thorax Diseases", CVPR 2017.
+
+2) ISIC 2019 Challenge Dataset
+   - Source: International Skin Imaging Collaboration
+   - URL: https://challenge.isic-archive.com/data/#2019
+   - License: CC-BY-NC 4.0 (Non-Commercial)
+   - Citation:
+     Tschandl P., Rosendahl C., Kittler H. "The HAM10000 dataset",
+     Scientific Data, 2018.
+     Codella N. et al., ISIC Challenge 2019.
+     Combalia M. et al., "BCN20000: Dermoscopic Lesions in the Wild", 2019.
+
+----------------------------------------------------------------------
+Third-party model weights (ImageNet pretrained)
+----------------------------------------------------------------------
+
+- EfficientNetB0 (tf.keras.applications) - Apache License 2.0
+- MobileNetV2    (tf.keras.applications) - Apache License 2.0
+- ResNet50       (tf.keras.applications) - MIT-style (Keras Applications)
+
+----------------------------------------------------------------------
+Libraries
+----------------------------------------------------------------------
+
+See requirements.txt. Each dependency retains its own license.

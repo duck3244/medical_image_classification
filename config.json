@@ -1,0 +1,58 @@
+{
+  "task": "nih_cxr_binary",
+  "available_tasks": ["nih_cxr_binary", "isic_multiclass"],
+
+  "backbone": "EfficientNetB0",
+  "available_backbones": ["EfficientNetB0", "MobileNetV2", "ResNet50"],
+
+  "img_size_nih": 256,
+  "img_size_isic": 224,
+
+  "num_classes_nih": 2,
+  "num_classes_isic": 7,
+  "isic_classes": ["MEL", "NV", "BCC", "AK", "BKL", "DF", "VASC"],
+
+  "batch_size": 16,
+  "grad_accum_steps": 2,
+  "epochs_head": 6,
+  "epochs_finetune": 12,
+  "lr_head": 5e-4,
+  "lr_finetune": 5e-6,
+  "fine_tune_at": 200,
+  "freeze_bn_on_finetune": true,
+
+  "dropout": 0.5,
+  "l2_reg": 1e-4,
+
+  "loss": "focal",
+  "focal_alpha": 0.25,
+  "focal_alpha_auto": true,
+  "focal_gamma": 3.0,
+  "class_weight_auto": true,
+  "oversample": true,
+
+  "use_clahe": true,
+  "grayscale_to_rgb": true,
+  "shuffle_buffer": 1000,
+
+  "mixed_precision": true,
+  "xla_jit": true,
+  "gradient_checkpointing": false,
+  "memory_growth": true,
+  "optimizer": "adamw",
+
+  "seed": 42,
+
+  "paths": {
+    "dataset_root": "dataset",
+    "nih_dir": "dataset/nih_cxr",
+    "isic_dir": "dataset/isic2019",
+    "models_dir": "models",
+    "logs_dir": "logs",
+    "results_dir": "results"
+  },
+
+  "early_stopping_patience": 8,
+  "reduce_lr_patience": 3,
+  "monitor_metric": "val_auc"
+}
