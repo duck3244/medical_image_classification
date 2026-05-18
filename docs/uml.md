@@ -1,66 +1,92 @@
 # UML Diagrams
 
 > Mermaid 기반 다이어그램. GitHub/IDE 미리보기에서 그대로 렌더링된다.
+> 풀스택(React ↔ FastAPI ↔ TF 파이프라인) 전체를 다룬다.
 
-## 1. Component Diagram
+## 1. Component Diagram (Full Stack)
 
 ```mermaid
 flowchart TB
-    CLI["main.py<br/>(argparse)"]
+    Browser["Browser (single user)"]
 
-    subgraph Orchestration
-        Bootstrap["utils.bootstrap()"]
-        Config["utils.load_config()<br/>+ validate_config()"]
+    subgraph Frontend["frontend/ (React 18 + Vite 5)"]
+        App["App.tsx<br/>Routes"]
+        Layout["Layout.tsx<br/>+ HealthDot (polling 15s)"]
+        Predict["pages/PredictPage"]
+        Models["pages/ModelsPage"]
+        Disclaimer["DisclaimerBanner<br/>DisclaimerModal"]
+        Client["api/client.ts<br/>fetch wrappers"]
+        QC["@tanstack/react-query<br/>QueryClient"]
     end
 
-    subgraph UseCases["Use-case Layer"]
-        Trainer["trainer.train()"]
-        Evaluator["evaluator.evaluate()"]
-        Predictor["predictor.predict()"]
-        Downloader["dataset_downloader.run()"]
+    subgraph Backend["backend/ (FastAPI)"]
+        AppPy["app.py<br/>lifespan / CORS / StaticFiles"]
+        RHealth["api/routes/health"]
+        RTasks["api/routes/tasks"]
+        RModels["api/routes/models"]
+        RPredict["api/routes/predict"]
+        SInf["services/inference<br/>cache + asyncio.Lock"]
+        SBoot["services/bootstrap<br/>synthetic auto-train"]
     end
 
-    subgraph Domain
-        Model["model.py<br/>build_model / unfreeze"]
-        Loss["trainer<br/>focal_loss / GradAccumModel"]
+    subgraph CLI["CLI (backend/main.py)"]
+        Main["main.py<br/>argparse"]
     end
 
-    subgraph Data
-        DataProc["data_processor.py<br/>build_pipeline / build_datasets"]
-        Manifest[("manifest CSV<br/>train/val/test")]
+    subgraph Pipeline["ML Pipeline"]
+        Utils["utils.py<br/>seed/GPU/validate_config"]
+        DataProc["data_processor.py<br/>tf.data"]
+        Model["model.py<br/>backbone factory"]
+        Trainer["trainer.py<br/>2-stage + GradAccum"]
+        Eval["evaluator.py"]
+        Predr["predictor.py<br/>+ Grad-CAM"]
+        Downloader["dataset_downloader.py"]
     end
 
-    subgraph Infra
-        Utils["utils.py<br/>seed / GPU / logger / save_json"]
-    end
+    FS[("Filesystem<br/>dataset/ models/<br/>uploads/ results/")]
 
-    CLI --> Bootstrap
-    CLI --> Config
-    CLI --> Trainer
-    CLI --> Evaluator
-    CLI --> Predictor
-    CLI --> Downloader
+    Browser --> App
+    App --> Layout
+    Layout --> Predict
+    Layout --> Models
+    Layout --> Disclaimer
+    Predict --> Client
+    Models --> Client
+    Layout --> Client
+    Client --> QC
+
+    Client -- "/api/* /static/*" --> AppPy
+    AppPy --> RHealth
+    AppPy --> RTasks
+    AppPy --> RModels
+    AppPy --> RPredict
+
+    AppPy --> SInf
+    AppPy --> SBoot
+    RPredict --> SInf
+    RHealth --> SInf
+    SInf --> Model
+    SInf --> Predr
+    SBoot --> Trainer
+    SBoot --> FS
+
+    Main --> Utils
+    Main --> Trainer
+    Main --> Eval
+    Main --> Predr
+    Main --> Downloader
 
     Trainer --> Model
-    Trainer --> Loss
     Trainer --> DataProc
-    Trainer --> Utils
-
-    Evaluator --> Model
-    Evaluator --> DataProc
-
-    Predictor --> Model
-    Predictor --> Utils
-
-    Downloader --> Manifest
-    DataProc --> Manifest
-    DataProc --> Model
-
-    Bootstrap --> Utils
-    Config --> Utils
+    Eval --> Model
+    Eval --> DataProc
+    Predr --> Model
+    DataProc --> FS
+    Downloader --> FS
+    AppPy -. "/static/results" .-> FS
 ```
 
-## 2. Class Diagram
+## 2. Class Diagram (Backend)
 
 ```mermaid
 classDiagram
@@ -152,6 +178,32 @@ classDiagram
         -_find_last_conv_layer(model) str
     }
 
+    class InferenceService {
+        <<module>>
+        -_lock: asyncio.Lock
+        -_model: keras.Model
+        -_model_key: Tuple~str,str,str~
+        +ensure_model(cfg, weights) Model
+        +warmup(cfg, weights) bool
+        +run_predict_one(cfg, weights, image, out_dir) dict
+        +find_default_weights(models_dir) Path
+        -_set_fp32_policy_if_mixed() void
+    }
+
+    class BootstrapService {
+        <<module>>
+        +generate_synthetic_dataset(data_dir, logger) void
+        +run_bootstrap_training(cfg, backend_dir, logger) Path
+        +auto_bootstrap(cfg, backend_dir, models_dir, logger) Path
+    }
+
+    class FastAPIApp {
+        <<entry>>
+        +app: FastAPI
+        +lifespan(app) async
+        -_make_logger() Logger
+    }
+
     GradAccumModel --|> kerasModel : extends
     GradAccumFlushCallback --|> kerasCallback : extends
     InnerWeightsCheckpoint --|> kerasCallback : extends
@@ -161,6 +213,12 @@ classDiagram
     Config ..> TaskParams : derives via get_task_params()
     Predictor ..> BackboneRegistry : build_model + load_weights
     DataPipeline ..> BackboneRegistry : get_preprocess_fn
+
+    FastAPIApp ..> InferenceService : warmup
+    FastAPIApp ..> BootstrapService : auto_bootstrap
+    InferenceService ..> Predictor : predict_one
+    InferenceService ..> BackboneRegistry : build_model
+    BootstrapService ..> DataPipeline : (via trainer.train)
 
     class kerasModel {
         <<external>>
@@ -172,7 +230,140 @@ classDiagram
     }
 ```
 
-## 3. Sequence — Training (`--mode train`)
+## 3. Class Diagram (Frontend, simplified)
+
+```mermaid
+classDiagram
+    class App {
+        <<component>>
+        +Routes
+    }
+
+    class Layout {
+        <<component>>
+        +HealthDot (useQuery health)
+        +DisclaimerBanner
+        +DisclaimerModal
+        +Outlet
+    }
+
+    class PredictPage {
+        <<component>>
+        -file: File
+        -previewUrl: string
+        -task / backbone / weights: string
+        +useQuery(tasks)
+        +useQuery(models)
+        +useMutation(postPredict)
+    }
+
+    class ModelsPage {
+        <<component>>
+        +useQuery(models)
+    }
+
+    class ApiClient {
+        <<module>>
+        +fetchHealth() HealthResponse
+        +fetchTasks() TasksResponse
+        +fetchModels() ModelsResponse
+        +postPredict(input) PredictResponse
+    }
+
+    class Types {
+        <<module>>
+        +HealthResponse
+        +TasksResponse
+        +ModelsResponse
+        +PredictResponse
+        +PredictResult
+        +ModelRun / WeightsFile
+    }
+
+    App --> Layout
+    Layout --> PredictPage
+    Layout --> ModelsPage
+    Layout --> ApiClient : fetchHealth (polling)
+    PredictPage --> ApiClient
+    ModelsPage --> ApiClient
+    ApiClient ..> Types
+```
+
+## 4. Sequence — Server Startup (`uvicorn app:app`)
+
+```mermaid
+sequenceDiagram
+    actor Op as Operator
+    participant U as uvicorn
+    participant App as app.py (lifespan)
+    participant Cfg as utils.load_config
+    participant GPU as utils.setup_gpu_memory_growth
+    participant Boot as services.bootstrap.auto_bootstrap
+    participant Inf as services.inference
+    participant FS as filesystem
+
+    Op->>U: uvicorn app:app --port 8000
+    U->>App: enter lifespan
+    App->>Cfg: load_config(backend/config.json)
+    Cfg->>Cfg: validate_config()
+    Cfg-->>App: cfg
+    App->>GPU: set memory_growth on all GPUs
+    App->>Inf: find_default_weights(models_dir)
+    alt 가중치 없음
+        App->>Boot: auto_bootstrap(cfg, backend_dir, models_dir)
+        Boot->>FS: generate synthetic dataset (60 imgs)
+        Boot->>Boot: trainer.train(boot_cfg) [1+1 epoch]
+        Boot-->>App: best.weights.h5 path
+    else 가중치 있음
+        Inf-->>App: existing path
+    end
+    App->>Inf: warmup(cfg, weights)
+    Inf->>Inf: _set_fp32_policy_if_mixed
+    Inf->>Inf: build_model + load_weights (asyncio.to_thread)
+    Inf-->>App: OK
+    App-->>U: ready
+    Op->>U: HTTP traffic
+```
+
+## 5. Sequence — Predict (POST /api/predict)
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant FE as PredictPage (React)
+    participant Q as react-query
+    participant API as FastAPI /api/predict
+    participant Inf as services.inference
+    participant P as predictor.predict_one
+    participant GC as grad_cam
+    participant FS as filesystem
+
+    User->>FE: choose file + (optional) overrides → Submit
+    FE->>Q: useMutation(postPredict)
+    Q->>API: POST multipart/form-data
+    API->>API: _validate_upload (ext / size ≤ 10MB)
+    API->>API: _build_request_config (override merge)
+    API->>API: get_task_params(cfg)  # num_classes/img_size 검증
+    API->>FS: write uploads/<uuid>.<ext>
+    API->>Inf: run_predict_one(cfg, weights, image, out_dir)
+    Inf->>Inf: ensure_model() [lock + lazy reload if key changed]
+    Inf->>P: asyncio.to_thread(predict_one, ...)
+    P->>P: _load_and_prepare (cv2 → CLAHE? → resize → preprocess)
+    P->>P: model.predict_on_batch(x)
+    P->>GC: grad_cam (Conv2D auto-detect)
+    GC-->>P: heatmap
+    P->>FS: write results/predict_<ts>_<hex>/<stem>_gradcam.png
+    P-->>Inf: result dict
+    Inf-->>API: result
+    API->>API: relative path → "/static/results/..."
+    API-->>Q: PredictResponse (disclaimer + result + gradcam_url)
+    Q-->>FE: data
+    FE->>FE: render class probs + Grad-CAM <img src>
+    FE->>API: GET /static/results/<run>/<file>  (img tag)
+    API->>FS: serve PNG
+```
+
+## 6. Sequence — Training CLI (`--mode train`)
 
 ```mermaid
 sequenceDiagram
@@ -237,39 +428,7 @@ sequenceDiagram
     CLI-->>User: log "학습 완료"
 ```
 
-## 4. Sequence — Inference + Grad-CAM (`--mode predict`)
-
-```mermaid
-sequenceDiagram
-    actor User
-    participant CLI as main.py
-    participant P as predictor.predict
-    participant M as model.build_model
-    participant GC as grad_cam
-    participant FS as filesystem
-
-    User->>CLI: python main.py --mode predict --image x.png --weights best.h5
-    CLI->>P: predict(cfg, weights, image, ...)
-    P->>M: build_model(backbone, num_classes, img_size)
-    M-->>P: keras.Model
-    P->>FS: load_weights(weights_path)
-
-    P->>P: _load_and_prepare(image)
-    Note right of P: cv2 read → CLAHE? → resize → backbone preprocess
-    P->>P: model.predict_on_batch(x)
-
-    P->>GC: grad_cam(model, x, class_idx?)
-    GC->>GC: _find_last_conv_layer() [Conv2D 타입 검사]
-    GC->>GC: GradientTape → pooled grads → ReLU → normalize
-    GC-->>P: heatmap (H,W) [0..1]
-
-    P->>P: overlay_heatmap + watermark (Disclaimer)
-    P->>FS: save <stem>_gradcam.png + result.json
-    P-->>CLI: result dict
-    CLI-->>User: 로그 + 산출물 경로
-```
-
-## 5. Sequence — Dataset Download (ISIC)
+## 7. Sequence — Dataset Download (ISIC)
 
 ```mermaid
 sequenceDiagram
@@ -299,7 +458,22 @@ sequenceDiagram
     DD-->>CLI: True
 ```
 
-## 6. State — Stage Transition (Trainer)
+## 8. State — Inference Model Cache
+
+```mermaid
+stateDiagram-v2
+    [*] --> Empty
+    Empty --> Loading : ensure_model(key=k)
+    Loading --> Loaded : build_model + load_weights OK
+    Loading --> Empty : exception (no retry, propagate)
+    Loaded --> Serving : run_predict_one (lock)
+    Serving --> Loaded : predict_one done
+    Loaded --> Reloading : ensure_model(key≠current)
+    Reloading --> Loaded : new model installed
+    Loaded --> [*] : process exit
+```
+
+## 9. State — Trainer Stage Transition
 
 ```mermaid
 stateDiagram-v2
@@ -320,7 +494,7 @@ stateDiagram-v2
     Error --> [*]
 ```
 
-## 7. Activity — Data Pipeline (한 샘플 처리)
+## 10. Activity — Data Pipeline (한 샘플 처리)
 
 ```mermaid
 flowchart LR
@@ -343,12 +517,41 @@ flowchart LR
     OneHot --> Out
 ```
 
-## 8. Deployment View
+## 11. Activity — Predict Request End-to-End
+
+```mermaid
+flowchart TB
+    UStart([User picks file in PredictPage]) --> Submit{Submit clicked}
+    Submit --> Mutation["useMutation(postPredict)"]
+    Mutation --> Multipart["FormData: file + overrides"]
+    Multipart --> Fetch["fetch('/api/predict', POST)"]
+    Fetch --> Validate{ext/size OK?}
+    Validate -- no --> Err400["400 / 413 with detail"]
+    Validate -- yes --> CfgMerge["build cfg (task/backbone override)"]
+    CfgMerge --> TP{"get_task_params(cfg)"}
+    TP -- ValueError --> Err400
+    TP -- OK --> WeightsPick{weights override or default?}
+    WeightsPick -- none --> Err503["503 no weights"]
+    WeightsPick -- ok --> Save["save uploads/<uuid>.<ext>"]
+    Save --> Lock["asyncio.Lock + to_thread"]
+    Lock --> Ensure["ensure_model(cache key)"]
+    Ensure --> PredOne["predictor.predict_one"]
+    PredOne --> GradCAM["overlay + watermark<br/>save PNG"]
+    GradCAM --> URL["build /static/results URL"]
+    URL --> Resp["JSON: disclaimer + result"]
+    Resp --> Render["React: probs + img src"]
+    Render --> UEnd([User sees result + Grad-CAM])
+    Err400 --> Render
+    Err503 --> Render
+```
+
+## 12. Deployment View
 
 ```mermaid
 flowchart LR
     subgraph Workstation["Single Workstation (RTX 4060 8GB)"]
-        Code["Python 3.9<br/>TF 2.x"]
+        Node["Node 18 + Vite dev (:5173)"]
+        Py["Python 3.9 + TF 2.10 + FastAPI/uvicorn (:8000)"]
         GPU["NVIDIA RTX 4060 Laptop GPU<br/>~5.3GB usable VRAM"]
         Disk["Local disk<br/>~50GB free"]
     end
@@ -359,10 +562,12 @@ flowchart LR
         Box["NIH Box (legacy)"]
     end
 
-    Code -->|tf.config.set_memory_growth| GPU
-    Code -->|hf_hub_download| HF
-    Code -->|requests stream| S3
-    Code -. fallback .-> Box
-    Code -->|read/write| Disk
-    GPU -->|VRAM| Code
+    Br["Browser"] -->|http :5173| Node
+    Node -->|proxy /api /static| Py
+    Py -->|tf.config.set_memory_growth| GPU
+    Py -->|hf_hub_download| HF
+    Py -->|requests stream| S3
+    Py -. fallback .-> Box
+    Py -->|read/write| Disk
+    GPU -->|VRAM| Py
 ```

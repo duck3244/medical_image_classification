@@ -18,21 +18,17 @@ NIH ChestX-ray14 / ISIC 2019 데이터셋 다운로드 및 매니페스트 생�
 
 from __future__ import annotations
 
-import hashlib
-import os
 import shutil
 import sys
 import tarfile
 import zipfile
 from pathlib import Path
-from typing import Optional
 
-import numpy as np
 import pandas as pd
 import requests
 from tqdm import tqdm
 
-from utils import get_logger, print_disclaimer, ensure_dirs
+from utils import get_logger, ensure_dirs
 
 
 # ======================================================================
@@ -125,7 +121,14 @@ def _download(url: str, dst: Path, logger) -> bool:
 def _extract_tar(tar_path: Path, dst_dir: Path, logger):
     logger.info(f"extracting {tar_path.name} → {dst_dir}")
     with tarfile.open(tar_path, "r:gz") as tf_:
-        tf_.extractall(dst_dir)
+        # PEP-706: filter='data'는 절대경로/상위참조/디바이스파일 등 위험 멤버를
+        # 거부하여 CVE-2007-4559 류 path traversal을 차단. 미지정 시 Python 3.12+에서
+        # DeprecationWarning + 향후 비호환 가능.
+        try:
+            tf_.extractall(dst_dir, filter="data")
+        except TypeError:
+            # 매우 오래된 Python 호환 fallback (filter 미지원 버전)
+            tf_.extractall(dst_dir)
 
 
 def download_nih(
@@ -467,7 +470,7 @@ def build_isic_manifest(isic_dir: str, logger=None):
 # ======================================================================
 
 def run(task: str, config: dict, agreed: bool = False, subset: float = 1.0, source: str = "huggingface"):
-    print_disclaimer()
+    # Disclaimer는 main.bootstrap에서 이미 출력하므로 여기서는 중복 호출하지 않는다.
     logger = get_logger("downloader", config["paths"]["logs_dir"])
     if task == "nih_cxr_binary":
         return download_nih(

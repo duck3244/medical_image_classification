@@ -191,7 +191,8 @@ _CONFIG_SCHEMA = [
     ("epochs_finetune", int, 0, 1000),
     ("lr_head", float, 1e-8, 1.0),
     ("lr_finetune", float, 1e-9, 1.0),
-    ("fine_tune_at", int, 0, 100000),
+    # fine_tune_at은 int(전체 백본 공통) 또는 dict[backbone -> int]이므로
+    # 스키마 자동 검증에서 제외하고 아래에서 별도 검사.
     ("dropout", float, 0.0, 0.95),
     ("l2_reg", float, 0.0, 1.0),
     ("loss", str, None, None),
@@ -254,6 +255,29 @@ def validate_config(cfg: dict) -> None:
     for key in _CONFIG_BOOL_KEYS:
         if key in cfg and not isinstance(cfg[key], bool):
             errors.append(f"'{key}': bool 기대 but {type(cfg[key]).__name__}")
+
+    # fine_tune_at: int(legacy) 또는 dict[backbone -> int]
+    if "fine_tune_at" not in cfg:
+        errors.append("필수 키 누락: 'fine_tune_at'")
+    else:
+        v = cfg["fine_tune_at"]
+        if isinstance(v, bool):
+            errors.append("'fine_tune_at': int 또는 dict 기대 but bool")
+        elif isinstance(v, int):
+            if not (0 <= v <= 100000):
+                errors.append(f"'fine_tune_at'={v} 범위 [0, 100000] 벗어남")
+        elif isinstance(v, dict):
+            if not v:
+                errors.append("'fine_tune_at': 빈 dict")
+            for bb, num in v.items():
+                if bb not in _VALID_BACKBONES:
+                    errors.append(f"'fine_tune_at': 알 수 없는 backbone 키 '{bb}'")
+                if isinstance(num, bool) or not isinstance(num, int):
+                    errors.append(f"'fine_tune_at.{bb}': int 기대 but {type(num).__name__}")
+                elif not (0 <= num <= 100000):
+                    errors.append(f"'fine_tune_at.{bb}'={num} 범위 [0, 100000] 벗어남")
+        else:
+            errors.append(f"'fine_tune_at': int 또는 dict 기대 but {type(v).__name__}")
 
     if cfg.get("task") not in _VALID_TASKS:
         errors.append(f"'task'='{cfg.get('task')}' not in {sorted(_VALID_TASKS)}")

@@ -12,8 +12,6 @@ trainer.py
 
 from __future__ import annotations
 
-import json
-import math
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -43,18 +41,31 @@ def binary_focal_loss(alpha: float = 0.25, gamma: float = 2.0):
     return loss_fn
 
 
-def categorical_focal_loss(alpha: float = 0.25, gamma: float = 2.0):
-    """softmax 출력용 categorical focal loss (one-hot 라벨)."""
+def categorical_focal_loss(alpha=0.25, gamma: float = 2.0):
+    """softmax 출력용 categorical focal loss (one-hot 라벨).
+
+    alpha:
+        - float: 모든 클래스에 동일 가중치 (기존 동작과 호환)
+        - 1D 시퀀스/array: 클래스별 가중치 벡터. 길이는 num_classes와 일치해야 한다.
+          ISIC 같이 분포가 심하게 치우친 다중분류에서 소수 클래스에 더 큰 가중치를
+          주려면 벡터 형태를 사용한다.
+    """
+    if hasattr(alpha, "__len__") and not isinstance(alpha, (str, bytes)):
+        alpha_t = tf.constant(list(alpha), dtype=tf.float32)
+    else:
+        alpha_t = tf.constant(float(alpha), dtype=tf.float32)
+
     def loss_fn(y_true, y_pred):
         y_true = tf.cast(y_true, tf.float32)
         y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
         ce = -y_true * tf.math.log(y_pred)
-        weight = alpha * tf.pow(1.0 - y_pred, gamma)
+        # alpha_t가 벡터면 클래스별 가중치를 axis=-1 브로드캐스트로 적용.
+        weight = alpha_t * tf.pow(1.0 - y_pred, gamma)
         return tf.reduce_mean(tf.reduce_sum(weight * ce, axis=-1))
     return loss_fn
 
 
-def build_loss(is_binary: bool, kind: str, alpha: float, gamma: float):
+def build_loss(is_binary: bool, kind: str, alpha, gamma: float):
     if kind == "focal":
         return binary_focal_loss(alpha, gamma) if is_binary else categorical_focal_loss(alpha, gamma)
     if is_binary:
@@ -184,11 +195,18 @@ def build_metrics(is_binary: bool):
         ]
     return [
         tf.keras.metrics.CategoricalAccuracy(name="acc"),
-        tf.keras.metrics.AUC(name="auc", multi_label=True),
+        # 단일 라벨 다중분류 → multi_label=False (OvR 평균). evaluator의
+        # sklearn roc_auc_score(multi_class='ovr')와 정합.
+        tf.keras.metrics.AUC(name="auc", multi_label=False),
     ]
 
 
-def build_optimizer(name: str, lr: float):
+def build_optimizer(name: str, lr: float, logger=None):
+    """이름 기반 옵티마이저 생성.
+
+    AdamW 요청 시: tf.keras → tensorflow_addons → 평문 Adam 순으로 폴백.
+    평문 Adam으로 폴백되면 weight_decay가 적용되지 않으므로 명시적으로 경고한다.
+    """
     name = (name or "adamw").lower()
     if name == "adamw":
         wd = 1e-3
@@ -199,6 +217,16 @@ def build_optimizer(name: str, lr: float):
                 from tensorflow_addons.optimizers import AdamW
                 return AdamW(weight_decay=wd, learning_rate=lr)
             except ImportError:
+                msg = (
+                    "AdamW 미지원 (tf.keras.optimizers.AdamW 없음 AND tensorflow_addons 미설치). "
+                    "weight_decay가 적용되지 않는 평문 Adam으로 폴백합니다. "
+                    "복구: pip install tensorflow-addons==0.18.0"
+                )
+                if logger is not None:
+                    logger.warning(msg)
+                else:
+                    import warnings
+                    warnings.warn(msg, RuntimeWarning)
                 return ko.Adam(learning_rate=lr)
     if name == "sgd":
         return ko.SGD(learning_rate=lr, momentum=0.9, nesterov=True)
@@ -294,6 +322,23 @@ def _wrap_for_accum(inner: tf.keras.Model, accum_steps: int) -> tf.keras.Model:
     return GradAccumModel(inner, accum_steps=accum_steps)
 
 
+def _resolve_fine_tune_at(cfg_value, backbone: str, logger) -> int:
+    """fine_tune_at 설정을 백본에 맞는 정수로 해석.
+    - int: 그대로 사용 (legacy)
+    - dict[backbone -> int]: backbone 키로 조회. 키 누락 시 명시적으로 raise.
+    """
+    if isinstance(cfg_value, dict):
+        if backbone not in cfg_value:
+            raise KeyError(
+                f"config.fine_tune_at 에 backbone '{backbone}' 키가 없습니다. "
+                f"존재 키: {list(cfg_value.keys())}"
+            )
+        v = int(cfg_value[backbone])
+        logger.info(f"fine_tune_at[{backbone}] = {v}")
+        return v
+    return int(cfg_value)
+
+
 def _compile(model, optimizer, loss, metrics):
     model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
 
@@ -309,9 +354,7 @@ def train(config: dict, logger) -> dict:
 
     # 1) 데이터셋
     batch_size = int(config["batch_size"])
-    train_ds, val_ds, test_ds, meta = _build_with_oom_retry(
-        config, tp, batch_size, logger
-    )
+    train_ds, val_ds, test_ds, meta = _build_train_datasets(config, tp, batch_size)
     logger.info(f"dataset sizes: {meta['sizes']}")
     logger.info(f"class weights: {meta['class_weights']}")
 
@@ -334,20 +377,35 @@ def train(config: dict, logger) -> dict:
         str(run_dir / "run_config.json"),
     )
 
-    # Focal alpha 자동화: binary task에서 focal_alpha_auto=true면 양성 비율 기반으로 설정.
-    # 양성 클래스(1)에 더 큰 가중치를 부여하기 위해 alpha = neg_ratio = 1 - pos_ratio 사용.
+    # Focal alpha 자동화:
+    # - binary: 양성 비율 기반 스칼라 alpha (alpha = 1 - pos_ratio).
+    # - multiclass: balanced class_weight를 sum=num_classes로 정규화한 per-class 벡터.
+    #   ISIC 같이 분포가 한쪽으로 치우친 경우 스칼라 alpha는 효과가 미미하므로 벡터로 가중.
     focal_alpha = float(config.get("focal_alpha", 0.25))
-    if (
-        is_binary
-        and bool(config.get("focal_alpha_auto", False))
-        and config.get("loss") == "focal"
-    ):
+    if config.get("loss") == "focal" and bool(config.get("focal_alpha_auto", False)):
         cw = meta.get("class_weights", {})
-        if 0 in cw and 1 in cw:
-            # balanced class_weight = total / (2*count_c). pos_ratio = w0/(w0+w1).
-            pos_ratio = cw[0] / (cw[0] + cw[1])
-            focal_alpha = float(max(0.05, min(0.95, 1.0 - pos_ratio)))
-            logger.info(f"focal_alpha auto-set to {focal_alpha:.4f} (pos_ratio={pos_ratio:.4f})")
+        if is_binary:
+            if 0 in cw and 1 in cw:
+                # balanced class_weight = total / (2*count_c). pos_ratio = w0/(w0+w1).
+                pos_ratio = cw[0] / (cw[0] + cw[1])
+                focal_alpha = float(max(0.05, min(0.95, 1.0 - pos_ratio)))
+                logger.info(
+                    f"focal_alpha auto-set to {focal_alpha:.4f} (pos_ratio={pos_ratio:.4f})"
+                )
+        else:
+            n_cls = tp["num_classes"]
+            if all(i in cw for i in range(n_cls)):
+                raw = np.array([cw[i] for i in range(n_cls)], dtype=np.float32)
+                # sum=n_cls로 정규화 → 클래스 평균 alpha가 1.0이 되도록 스케일.
+                alpha_vec = raw * (n_cls / raw.sum())
+                # 극단치 방지 클램프
+                alpha_vec = np.clip(alpha_vec, 0.05, 10.0)
+                focal_alpha = alpha_vec.tolist()
+                logger.info(
+                    "focal_alpha auto-set (per-class): "
+                    + ", ".join(f"{tp['class_names'][i]}={v:.3f}"
+                                for i, v in enumerate(alpha_vec))
+                )
 
     loss = build_loss(
         is_binary,
@@ -372,26 +430,34 @@ def train(config: dict, logger) -> dict:
     logger.info("Stage 1: head-only training")
     logger.info("=" * 60)
     model = _wrap_for_accum(inner, accum_steps)
-    _compile(model, build_optimizer(config["optimizer"], float(config["lr_head"])), loss, metrics)
+    _compile(model, build_optimizer(config["optimizer"], float(config["lr_head"]), logger), loss, metrics)
 
-    cbs = build_callbacks(
-        run_dir / "stage1",
-        monitor=monitor,
-        es_patience=int(config["early_stopping_patience"]),
-        lr_patience=int(config["reduce_lr_patience"]),
-        inner_for_ckpt=inner if accum_steps > 1 else None,
-    )
-    if isinstance(model, GradAccumModel):
-        cbs.append(GradAccumFlushCallback(model))
+    def _make_cbs_stage1():
+        out = build_callbacks(
+            run_dir / "stage1",
+            monitor=monitor,
+            es_patience=int(config["early_stopping_patience"]),
+            lr_patience=int(config["reduce_lr_patience"]),
+            inner_for_ckpt=inner if accum_steps > 1 else None,
+        )
+        if isinstance(model, GradAccumModel):
+            out.append(GradAccumFlushCallback(model))
+        return out
+
     (run_dir / "stage1").mkdir(parents=True, exist_ok=True)
+    cbs = _make_cbs_stage1()
 
-    hist1 = model.fit(
-        train_ds,
-        validation_data=val_ds,
+    hist1, train_ds, val_ds, batch_size = _fit_with_oom_retry(
+        model,
+        train_ds=train_ds, val_ds=val_ds,
         epochs=int(config["epochs_head"]),
         callbacks=cbs,
         class_weight=class_weight,
-        verbose=2,
+        stage_name="Stage1",
+        current_batch=batch_size,
+        config=config, tp=tp,
+        callbacks_builder=_make_cbs_stage1,
+        logger=logger,
     )
     log_vram_usage(logger, "after stage1")
 
@@ -403,7 +469,7 @@ def train(config: dict, logger) -> dict:
     logger.info("=" * 60)
     info = unfreeze_for_finetune(
         base,
-        fine_tune_at=int(config["fine_tune_at"]),
+        fine_tune_at=_resolve_fine_tune_at(config["fine_tune_at"], config["backbone"], logger),
         freeze_bn=bool(config["freeze_bn_on_finetune"]),
     )
     logger.info(f"unfreeze info: {info}")
@@ -411,26 +477,34 @@ def train(config: dict, logger) -> dict:
 
     if isinstance(model, GradAccumModel):
         model.reset_accumulators()
-    _compile(model, build_optimizer(config["optimizer"], float(config["lr_finetune"])), loss, metrics)
+    _compile(model, build_optimizer(config["optimizer"], float(config["lr_finetune"]), logger), loss, metrics)
 
-    cbs2 = build_callbacks(
-        run_dir / "stage2",
-        monitor=monitor,
-        es_patience=int(config["early_stopping_patience"]),
-        lr_patience=int(config["reduce_lr_patience"]),
-        inner_for_ckpt=inner if accum_steps > 1 else None,
-    )
-    if isinstance(model, GradAccumModel):
-        cbs2.append(GradAccumFlushCallback(model))
+    def _make_cbs_stage2():
+        out = build_callbacks(
+            run_dir / "stage2",
+            monitor=monitor,
+            es_patience=int(config["early_stopping_patience"]),
+            lr_patience=int(config["reduce_lr_patience"]),
+            inner_for_ckpt=inner if accum_steps > 1 else None,
+        )
+        if isinstance(model, GradAccumModel):
+            out.append(GradAccumFlushCallback(model))
+        return out
+
     (run_dir / "stage2").mkdir(parents=True, exist_ok=True)
+    cbs2 = _make_cbs_stage2()
 
-    hist2 = model.fit(
-        train_ds,
-        validation_data=val_ds,
+    hist2, train_ds, val_ds, batch_size = _fit_with_oom_retry(
+        model,
+        train_ds=train_ds, val_ds=val_ds,
         epochs=int(config["epochs_finetune"]),
         callbacks=cbs2,
         class_weight=class_weight,
-        verbose=2,
+        stage_name="Stage2",
+        current_batch=batch_size,
+        config=config, tp=tp,
+        callbacks_builder=_make_cbs_stage2,
+        logger=logger,
     )
     log_vram_usage(logger, "after stage2")
 
@@ -473,33 +547,80 @@ def train(config: dict, logger) -> dict:
 
 
 # ======================================================================
-# OOM 자동 폴백
+# 데이터셋 빌드 + OOM 폴백 fit
 # ======================================================================
 
-def _build_with_oom_retry(config, tp, batch_size, logger, max_retries: int = 2):
-    """
-    데이터셋 빌드는 OOM을 일으키지 않지만, 학습 직전에 실제 batch로 한 번 실행해
-    fit()에서 ResourceExhaustedError가 나면 호출자에서 batch_size를 줄여 재시도.
-    여기서는 단순히 batch_size만 반영해 빌드.
+def _build_train_datasets(config, tp, batch_size):
+    """현재 batch_size로 train/val/test 파이프라인 빌드."""
+    return build_datasets(
+        data_dir=tp["data_dir"],
+        task=tp["task"],
+        backbone=config["backbone"],
+        img_size=tp["img_size"],
+        num_classes=tp["num_classes"],
+        batch_size=batch_size,
+        use_clahe=bool(config.get("use_clahe", True)),
+        shuffle_buffer=int(config.get("shuffle_buffer", 1000)),
+        cache=bool(config.get("cache_dataset", False)),
+        oversample=bool(config.get("oversample", False)),
+        seed=int(config.get("seed", 42)),
+    )
+
+
+def _fit_with_oom_retry(
+    model,
+    *,
+    train_ds,
+    val_ds,
+    epochs,
+    callbacks,
+    class_weight,
+    stage_name: str,
+    current_batch: int,
+    config,
+    tp,
+    callbacks_builder,
+    logger,
+    max_retries: int = 2,
+):
+    """model.fit() 호출을 감싸고 tf.errors.ResourceExhaustedError 발생 시
+    batch_size를 반감 후 데이터셋·콜백을 재빌드하여 재시도한다.
+
+    Args:
+        callbacks_builder: 인자 없이 호출되어 새 콜백 리스트를 반환하는 callable.
+            EarlyStopping/ReduceLROnPlateau는 상태를 가지므로 재시도마다 새로 만들어야 함.
+
+    Returns:
+        (history, train_ds, val_ds, last_batch_size)
     """
     attempt = 0
     while True:
         try:
-            return build_datasets(
-                data_dir=tp["data_dir"],
-                task=tp["task"],
-                backbone=config["backbone"],
-                img_size=tp["img_size"],
-                num_classes=tp["num_classes"],
-                batch_size=batch_size,
-                use_clahe=bool(config.get("use_clahe", True)),
-                shuffle_buffer=int(config.get("shuffle_buffer", 1000)),
-                cache=bool(config.get("cache_dataset", False)),
-                oversample=bool(config.get("oversample", False)),
+            hist = model.fit(
+                train_ds,
+                validation_data=val_ds,
+                epochs=epochs,
+                callbacks=callbacks,
+                class_weight=class_weight,
+                verbose=2,
             )
+            return hist, train_ds, val_ds, current_batch
         except tf.errors.ResourceExhaustedError:
             attempt += 1
-            if attempt > max_retries or batch_size <= 1:
+            if attempt > max_retries or current_batch <= 1:
+                logger.error(
+                    f"{stage_name}: OOM 폴백 {max_retries}회 후에도 실패. "
+                    f"마지막 batch_size={current_batch}"
+                )
                 raise
-            batch_size = max(1, batch_size // 2)
-            logger.warning(f"OOM during dataset build → batch_size={batch_size} 재시도")
+            new_batch = max(1, current_batch // 2)
+            logger.warning(
+                f"{stage_name}: ResourceExhaustedError → batch_size {current_batch} → {new_batch} 로 재시도 "
+                f"(attempt={attempt}/{max_retries})"
+            )
+            current_batch = new_batch
+            # GradAccumModel은 누적 변수 잔여 grad를 비워야 한다.
+            if isinstance(model, GradAccumModel):
+                model.reset_accumulators()
+            train_ds, val_ds, _, _ = _build_train_datasets(config, tp, current_batch)
+            callbacks = callbacks_builder()

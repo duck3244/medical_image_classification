@@ -1,3 +1,15 @@
+# Project-specific artifacts (backend)
+backend/dataset/
+backend/models/
+backend/logs/
+backend/results/
+backend/uploads/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

@@ -19,11 +19,11 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 import tensorflow as tf
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from data_processor import _apply_clahe_np
 from model import build_model, get_preprocess_fn
-from utils import DISCLAIMER_KO, get_task_params, save_json
+from utils import get_task_params, save_json
 
 
 # ======================================================================
@@ -43,10 +43,18 @@ def _load_and_prepare(
         display_rgb: 시각화용 uint8 RGB (img_size, img_size, 3)
         model_input: 모델 입력 float32 (1, img_size, img_size, 3) - 백본 preprocess 적용
     """
-    bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
-    if bgr is None:
-        raise FileNotFoundError(f"이미지를 읽을 수 없음: {image_path}")
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    # cv2.imread는 EXIF orientation 태그를 무시하므로 휴대폰 등에서 촬영된 이미지가
+    # 시각적으로 회전되어 있을 수 있다. PIL로 먼저 열어 exif_transpose 적용 후 RGB 배열로 변환.
+    try:
+        pil_img = Image.open(image_path)
+        pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
+        rgb = np.array(pil_img)
+    except (FileNotFoundError, OSError, Image.UnidentifiedImageError) as e:
+        # PIL 실패 시 cv2로 폴백 (예: PIL이 인식 못하는 변종 포맷)
+        bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise FileNotFoundError(f"이미지를 읽을 수 없음: {image_path}") from e
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
     if task == "nih_cxr_binary" and use_clahe:
         rgb = _apply_clahe_np(rgb)
@@ -168,6 +176,7 @@ def predict_one(
     image_path: str,
     out_dir: Path,
     save_gradcam: bool = True,
+    out_stem: Optional[str] = None,
 ) -> dict:
     tp = get_task_params(config)
     is_binary = tp["is_binary"]
@@ -216,7 +225,8 @@ def predict_one(
                 f"— 교육용 / NOT FOR DIAGNOSIS",
             )
             out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = out_dir / f"{Path(image_path).stem}_gradcam.png"
+            stem = out_stem or Path(image_path).stem
+            out_path = out_dir / f"{stem}_gradcam.png"
             Image.fromarray(stamped).save(out_path)
             result["gradcam_path"] = str(out_path)
         except (ImportError, ValueError, RuntimeError, tf.errors.InvalidArgumentError) as e:
@@ -238,13 +248,23 @@ def predict_dir(
     out_dir: Path,
     exts: Tuple[str, ...] = (".png", ".jpg", ".jpeg"),
 ) -> List[dict]:
-    paths = [
-        p for p in sorted(Path(input_dir).rglob("*"))
-        if p.suffix.lower() in exts
-    ]
+    root = Path(input_dir)
+    paths = [p for p in sorted(root.rglob("*")) if p.suffix.lower() in exts]
     results = []
+    seen_stems: set = set()
     for p in paths:
-        results.append(predict_one(config, model, str(p), out_dir))
+        # 서로 다른 서브폴더에 동일 파일명(예: a/img.png, b/img.png)이 있을 때
+        # 단순 stem 사용 시 결과 파일이 덮어쓰여짐. 상대경로 슬러그로 유일화하고,
+        # 충돌 시 _2, _3 ... suffix로 추가 방어.
+        rel = p.relative_to(root).with_suffix("")
+        stem = str(rel).replace("/", "_").replace("\\", "_") or p.stem
+        base = stem
+        i = 2
+        while stem in seen_stems:
+            stem = f"{base}_{i}"
+            i += 1
+        seen_stems.add(stem)
+        results.append(predict_one(config, model, str(p), out_dir, out_stem=stem))
     return results
 
 
@@ -260,6 +280,18 @@ def predict(
     logger,
 ) -> dict:
     print(">>> [DISCLAIMER] 본 결과는 교육·학습용입니다. 진단에 사용할 수 없습니다.")
+
+    # Grad-CAM은 마지막 conv 출력에 대한 그래디언트가 필요한데,
+    # mixed_float16 정책 하에서는 conv 출력이 fp16이라 미세한 그래디언트가
+    # underflow → 결과적으로 all-zero CAM이 생성됨. 추론 시점에는 fp32로 강제.
+    cur_policy = str(tf.keras.mixed_precision.global_policy().name)
+    if cur_policy.startswith("mixed"):
+        logger.info(
+            f"추론 모드 진입: global policy {cur_policy} → float32로 변경 "
+            "(Grad-CAM gradient underflow 방지)."
+        )
+        tf.keras.mixed_precision.set_global_policy("float32")
+
     model = load_model_for_inference(config, weights_path)
     logger.info(f"weights loaded: {weights_path}")
 

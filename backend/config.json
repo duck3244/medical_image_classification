@@ -18,7 +18,11 @@
   "epochs_finetune": 12,
   "lr_head": 5e-4,
   "lr_finetune": 5e-6,
-  "fine_tune_at": 200,
+  "fine_tune_at": {
+    "EfficientNetB0": 200,
+    "MobileNetV2": 110,
+    "ResNet50": 140
+  },
   "freeze_bn_on_finetune": true,
 
   "dropout": 0.5,

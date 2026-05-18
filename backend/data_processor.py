@@ -13,7 +13,7 @@ tf.data 기반 학습/검증/테스트 파이프라인.
 """
 
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Tuple
 
 import numpy as np
 import pandas as pd
@@ -173,11 +173,13 @@ def build_pipeline(
     shuffle_buffer: int = 1000,
     cache: bool = False,
     oversample: bool = False,
+    seed: int = 42,
 ) -> tf.data.Dataset:
     """
     Args:
         task: "nih_cxr_binary" | "isic_multiclass"
         backbone: 백본 이름 (preprocess_input 선택용)
+        seed: shuffle / sample_from_datasets에 적용할 RNG seed
     """
     preprocess_input = get_preprocess_fn(backbone)
     is_binary = num_classes == 2
@@ -187,15 +189,22 @@ def build_pipeline(
         labels = sub_manifest["label"].astype(np.int32).values
         d = tf.data.Dataset.from_tensor_slices((paths, labels))
         if shuffle:
+            # config의 shuffle_buffer는 하한선 의미로만 사용하고,
+            # 실제 buffer는 manifest 크기와의 min을 취해 자동 산정.
+            # 극심 클래스 불균형(예: NIH 양성 1%) + 작은 buffer면 양성 미포함
+            # 배치가 다수 발생 → 학습 초기 안정성 저해. 따라서 datasource 크기를
+            # 다 담을 수 있으면 전수, 아니면 config 값과 dataset_size//10·10K floor 중 큰 값.
+            n = max(1, len(sub_manifest))
+            buf = min(max(shuffle_buffer, 1), n)
+            if buf < n:
+                buf = min(n, max(buf, min(10000, max(1, n // 10))))
             d = d.shuffle(
-                buffer_size=min(shuffle_buffer, max(1, len(sub_manifest))),
+                buffer_size=buf,
                 reshuffle_each_iteration=True,
-                seed=42,
-            ).repeat() if oversample else d.shuffle(
-                buffer_size=min(shuffle_buffer, max(1, len(sub_manifest))),
-                reshuffle_each_iteration=True,
-                seed=42,
+                seed=seed,
             )
+            if oversample:
+                d = d.repeat()
 
         def _load(path, label):
             img = _decode_image(path, channels=3)
@@ -231,21 +240,24 @@ def build_pipeline(
         d = d.map(_finalize, num_parallel_calls=AUTOTUNE)
         return d
 
-    if oversample and is_binary and shuffle:
-        # 양성/음성 각각 repeat하여 50:50으로 샘플링 (binary only).
-        pos_df = manifest[manifest["label"] == 1]
-        neg_df = manifest[manifest["label"] == 0]
-        if len(pos_df) == 0 or len(neg_df) == 0:
-            ds = _build_sample_ds(manifest)
-        else:
-            ds_pos = _build_sample_ds(pos_df)
-            ds_neg = _build_sample_ds(neg_df)
+    if oversample and shuffle:
+        # 클래스별로 sub-dataset을 만들고 균등 weights로 sample_from_datasets.
+        # binary(2)뿐 아니라 임의 K-class에서 동일 로직으로 동작 (ISIC 7-class 포함).
+        unique_labels = sorted(int(v) for v in manifest["label"].unique())
+        if len(unique_labels) >= 2:
+            sub_ds = [
+                _build_sample_ds(manifest[manifest["label"] == lab])
+                for lab in unique_labels
+            ]
+            weights = [1.0 / len(unique_labels)] * len(unique_labels)
             ds = tf.data.Dataset.sample_from_datasets(
-                [ds_neg, ds_pos], weights=[0.5, 0.5], seed=42
+                sub_ds, weights=weights, seed=seed
             )
             # 1 epoch 길이를 원 manifest 크기로 한정
-            steps_per_epoch = len(manifest)
-            ds = ds.take(steps_per_epoch)
+            ds = ds.take(len(manifest))
+        else:
+            # 한 클래스만 존재하면 oversample 무의미 → 원 분포 그대로.
+            ds = _build_sample_ds(manifest)
     else:
         ds = _build_sample_ds(manifest)
     # 학습 split은 drop_remainder=True로 binary label reshape([1])과의 shape 일관성 확보.
@@ -273,6 +285,7 @@ def build_datasets(
     shuffle_buffer: int = 1000,
     cache: bool = False,
     oversample: bool = False,
+    seed: int = 42,
 ) -> Tuple[tf.data.Dataset, tf.data.Dataset, tf.data.Dataset, dict]:
     """
     data_dir 하위에 train.csv / val.csv / test.csv 매니페스트가 있어야 한다.
@@ -292,6 +305,7 @@ def build_datasets(
         batch_size=batch_size,
         use_clahe=use_clahe,
         shuffle_buffer=shuffle_buffer,
+        seed=seed,
     )
 
     train_ds = build_pipeline(
